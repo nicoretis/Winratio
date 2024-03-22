@@ -1,0 +1,518 @@
+---
+title: "winratio"
+format: html
+editor: visual
+---
+
+```{r}
+if(!require('pacman')){
+  install.packages('pacman')
+}
+pacman::p_load(wrappedtools,tidyverse,magrittr,tibble,BuyseTest,DescTools,devtools)
+```
+
+## Simulation of two tibbles for the RDN arm and the SHAM arm.
+
+```{r}
+
+# Creation of a tibble with normal distribution values using the different hierarchical endpoints considered in the Kandzari paper:
+#amb= Δ ASBP: 24-hr mean ambulatory systolic blood pressure change from baseline to follow-up
+#off=  Δ OSBP: Office systolic blood pressure change from baseline to follow-up
+#med= Δ Medication Index: Prescribed medication burden change from baseline to follow-up.
+# Set the seed for reproducibility
+set.seed(3)
+# Number of patients
+n_rows <- 40
+sequence <- seq(-0.5, 0.5, by = 0.25)
+med <- sample(sequence, 40, replace = TRUE)
+#Medication index barely changed in the RDN group after 6 months
+RDN <- tibble(
+  amb = c(round(rnorm(n_rows - 4, mean = -9, sd = 11)), rep(NA, 4)),
+  off = c(round(rnorm(n_rows - 2, mean = -9.4, sd = 12.5)), rep(NA, 2)),
+  med)
+#Medication index slightly got worse in SHAM group
+sequence <- seq(-1, 1.5, by = 0.25)
+med <- sample(sequence, 40, replace = TRUE)
+SHAM<- tibble(
+  amb = c(round(rnorm(n_rows - 4, mean = -1.6, sd = 10.7)), rep(NA, 4)),
+  off = c(round(rnorm(n_rows , mean = -2.6, sd = 12.9))),
+  med)
+```
+
+The approach operates by comparing each patient in the Renal Denervation (RDN) group with every patient in the SHAM (control) group, resulting in a total of (N RDN x N SHAM) comparisons, which equals 40 x 40 = 1600 comparisons.
+
+Initially, we focus on the most crucial parameter, the first column Δ ASBP (ambulatory pressure). If, after 6 months, the pressure difference between RDN and SHAM patients is -5 mm Hg or less, it's categorized as a 'Win.' Conversely, if the difference is 5 mm Hg or more, it's marked as 'Lost.'
+
+Intermediate cases, where the difference falls within other ranges, are considered 'Tied.' In such cases, the analysis proceeds to the next parameter in order of importance, such as Δ OSBP. If a 'Tied' result persists in Δ OSBP, we then consider the Δ medication index.
+
+Missing data is automatically treated as a 'Tied' outcome.
+
+-   *Asymmetrical Rules Approach*
+
+By structuring the rules in this manner, the function automatically determines how many endpoints to process and their hierarchical order. Rules are written as shown in this example:
+
+`rules <- "win<=-5,lost>=10;win<=-20,lost>=10;win<=5,lost>=15"`
+
+In the rules, 'Win' and 'Lost' conditions are separated by commas, while endpoints are separated by semicolons. While it may not appear as the most elegant method, it provides a flexible way to define rules. This approach is particularly robust as it allows us to decide on the conditions to be met for every endpoint.
+
+For instance:
+
+`rules <- "win<=-3,lost>=10;win<=-10,lost>10;win==-1,lost>=1"`
+
+This format allows for a versatile specification of conditions for each endpoint.
+
+The **`extract_rules`** function takes a formatted string, as demonstrated in the example, and extracts the win/lose operator as well as the win/lose thresholds for each endpoint.
+
+```{r}
+extract_rules <- function(asy_rules){
+  elements <- str_split(asy_rules, ";")[[1]]
+  #elements are the rules for each endpoint
+  win_conditions <- unlist(str_split(elements, ","))[grep("win", unlist(str_split(elements, ",")))] #win condition are the rules specifying when a comparison wins
+  win_ope<-str_extract(win_conditions, pattern = "[!><=]+")
+  #win_ope are just the signs of the comparison. It could be general like >= or < or == or !=
+  win_thr<-str_extract(win_conditions, pattern = "-?\\d+")|> as.numeric()
+  #Numeric (positive or negative) threshold that is considered
+  lost_conditions <- unlist(str_split(elements, ","))[grep("lost", unlist(str_split(elements, ",")))] #Same procedure is done for lost_conditions
+  lost_ope<-str_extract(lost_conditions, pattern = "[!><=]+")
+  lost_thr<-str_extract(lost_conditions, pattern = "-?\\d+")|> as.numeric()
+  return(list(elements=elements,win_ope = win_ope, win_thr = win_thr, lost_ope = lost_ope, lost_thr = lost_thr))}
+```
+
+The **`rules_comparison`** function incorporates the **`extract_rules`** functionality. It assigns the outcome of the comparison, following the specified rules, to a specific combination of patients from the treatment and control groups.
+
+# Asymmetric comparison
+
+```{r}
+asymmetric_comparison <- function(asy_rules, comb,treatmentdata,controldata) {
+  x <- extract_rules(asy_rules)
+  elements <- x$elements
+  win_ope <- x$win_ope
+  win_thr <- x$win_thr
+  lost_ope <- x$lost_ope
+  lost_thr <- x$lost_thr
+  if (length(elements) > ncol(treatmentdata) || length(elements) > ncol(controldata)) {
+    print("Too many rules for the amount of columns")
+    return()
+}
+  
+  for (i in seq_along(elements)) {
+    
+  leftel<-treatmentdata[[i]][comb[, 1]] |> as.numeric()
+  rightel<- controldata[[i]][comb[, 2]] |> as.numeric()
+  #First we will dealing  with NAs
+      if (i != length(elements)) {
+      
+      if (is.na(leftel) || is.na(rightel)) {
+        next
+        #Skip to the next iteration if any value is missing
+      }
+    } else {
+      if (is.na(leftel) || is.na(rightel)) {
+        result <- paste("Tied", i)
+        return(result)
+        #If we are considering the last endpoint and we have NA
+        #then it is automatically Tied
+      }
+    }
+    
+    subtraction <- leftel-rightel
+    #For now, we consider only subtraction but it could be modified
+    #to be more general as possible
+    
+    result_win <- switch(win_ope[i],
+      `<=` = if (subtraction <= win_thr[i]) "Won" else "Tied",
+      `>=` = if (subtraction >= win_thr[i]) "Won" else "Tied",
+      `>` = if (subtraction > win_thr[i]) "Won" else "Tied",
+      `<` = if (subtraction < win_thr[i]) "Won" else "Tied",
+      `==` = if (subtraction == win_thr[i]) "Won" else "Tied",
+      `!=` = if (subtraction != win_thr[i]) "Won" else "Tied","Tied")
+    
+    #If the operator sign is one of the following and the equation is TRUE
+    #then it is assigned as a Win, conversely it is a Tied
+
+      result_lost <- switch(lost_ope[i],
+        `<=` = if (subtraction <= lost_thr[i]) "Lost" else "Tied",
+        `>=` = if (subtraction >= lost_thr[i]) "Lost" else "Tied",
+        `>` = if (subtraction > lost_thr[i]) "Lost" else "Tied",
+        `<` = if (subtraction < lost_thr[i]) "Lost" else "Tied",
+        `==` = if (subtraction == lost_thr[i]) "Lost" else "Tied",
+        `!=` = if (subtraction != lost_thr[i]) "Lost" else "Tied","Tied")
+      
+    #Unless something went wrong we should not have Win in result_win and Lost in result_lost simultaneously
+    #This means that we can break the loop as soon as we have a Win or a Lost
+    #If we have Tied in both win_result and in lost_result than we proceed with the next iteration
+    if (result_win == "Won") {
+      result <- paste("Won", i)
+      return(result)
+      break
+    } else if (result_lost == "Lost") {
+      result <- paste("Lost", i)
+      return(result)
+      break
+    } else if (i == length(elements) && (result_win == "Tied" && result_lost == "Tied")) {
+      result <- paste("Tied", i)
+    #If we are in the last iteration and we have Tied in
+    #both win_result and in lost_result than it is assigned as Tied
+      return(result)
+      break
+    }
+  }
+  
+}
+```
+
+# Symmetric comparison
+
+Explained as following:
+
+$$
+\\IF:  Index_{\text{threshold}} < 0\\
+Index_{\text{subtraction}} \leq Index_{threshold} \Rightarrow \text{Win}\\\
+Index_{\text{subtraction}} \geq -Index_{threshold} \Rightarrow \text{Loss}\\\
+\\IF:  Index_{\text{threshold}} > 0\\
+Index_{\text{subtraction}} \geq  Index_{threshold} \Rightarrow \text{Win}\\
+Index_{\text{subtraction}} \leq  -Index_{threshold} \Rightarrow \text{Lost}\\\
+\\
+Index_{\text{threshold}} \neq 0
+$$
+
+Using 0 as a threshold is avoided due to its ambiguity. Without specifying a 'greater-than' or 'smaller-than' sign (which might be introduced in future versions), it remains uncertain which interval is considered 'Win' and which is considered 'Lost'.
+
+```{r}
+symmetric_comparison <- function(thresholds,comb,treatmentdata,controldata){
+  if (length(thresholds) > ncol(treatmentdata) || length(thresholds) > ncol(controldata)) {
+    print("Too many rules for the amount of columns")
+    return()
+} #Checking that columns and rules are matching
+
+  for (i in seq_along(thresholds)){
+    if (thresholds[i]==0){
+      print("0 is not a valid threshold, insert a new threshold")
+      break
+    }
+    leftel<-treatmentdata[[i]][comb[, 1]] #column of rule "i" and row of chosen by the first element of combination
+    rightel<- controldata[[i]][comb[, 2]]
+    
+    if (i != length(thresholds)) {
+      if (is.na(leftel) || is.na(rightel)) {
+        next
+        #Skip to the next iteration if any value is missing
+      }
+    } else {
+      if (is.na(leftel) || is.na(rightel)) {
+        result <- paste("Tied", i)
+        return(result)
+        #If we are considering the last endpoint and we have NA
+        #then it is automatically Tied
+      }
+    }
+    
+    subtraction <- leftel-rightel
+    
+     if (thresholds[i]<0) {
+      if (subtraction <= thresholds[i]) {
+       result <- paste("Won", i)
+       return (result)
+       break
+     }
+     else if (subtraction >= -1*thresholds[i]){
+       result <- paste("Lost", i)
+       return (result)
+       break
+     }
+    else {
+      result <- "Tied"
+    }
+     }
+    else{
+       if (subtraction <= -1*thresholds[i]) {
+       result <- paste("Lost", i)
+       return (result)
+       break
+     }
+     else if (subtraction >= thresholds[i]){
+       result <- paste("Won", i)
+       return (result)
+       break
+     }
+    else {
+      result <-"Tied"
+    }
+    }
+    #If it is the last iteration and the result is tied then it is tied
+    if (i == length(thresholds)){
+      if (result =="Tied"){
+        result <- paste("Tied",i)
+        return(result)
+        break
+      }
+    }
+  }
+}
+```
+
+We iterate through every possible combination of elements using the General Pairwise Comparison (GPC) approach, applying the previously defined functions. This process determines, for each combination, one of three results: Won, Loss, or Tied.
+
+The arguments for the 'gpc' function include:
+
+1.  Treatment group (necessary): should contain only the columns with the endpoints already hierarchically ordered.
+
+2.  Control group (necessary): should contain only the columns with the endpoints already hierarchically ordered.
+
+3.  Thresholds (optional): a vector of threshold numbers, in case the rules are symmetrically placed around 0 (e.g., thresholds = c(5, -1, 10...))
+
+4.  Rules (optional): a string of rules if an asymmetrical condition needs to be specified (e.g., rules= 'win\<=-15,lost\>=5;win\<=-10,lost\>=20;win\<=-1,lost==1;...')
+
+```{r}
+gpc <- function(treatmentdata,controldata,thresholds=NULL,asy_rules=NULL) {
+    if (ncol(treatmentdata) != ncol(controldata)){
+    print("Treatment and Control group should have the same amount of endpoints (columns)")
+    return()}
+  combinations <- expand.grid(treatmentdata= seq_len(nrow(treatmentdata)), controldata = seq_len(nrow(controldata)))
+  rawdata <- tibble()
+  rawdata <- tibble(treatmentpatient = combinations$treatmentdata, controlpatient= combinations$controldata)
+  # Apply the function to each combination and store results in the new result column
+  if (!is.null(thresholds)) {
+  rawdata <- rawdata |>
+  mutate(result = map_chr(seq_len(n()), ~symmetric_comparison(thresholds,combinations[.x, ],treatmentdata,controldata)))
+    } else if (!is.null(asy_rules)){
+     rawdata <- rawdata |>
+  mutate(result = map_chr(seq_len(n()), ~asymmetric_comparison(asy_rules,combinations[.x, ],treatmentdata,controldata)))
+    }
+  else{
+    print("Please assign winning thresholds or winning and losing rules for the comparisons")
+    return()
+    break
+  }
+  rawdata$level<-str_extract(rawdata$result, pattern = "\\d+")|> as.numeric()
+  rawdata$result <- sub(pattern = " \\d+", replacement = "", x = rawdata$result)
+  
+  wins=rawdata|> filter(result=="Won")|>count() |>pull(n)
+  losses=rawdata|> filter(result=="Lost")|>count() |>pull(n)
+  draws=rawdata|> filter(result=="Tied")|>count() |>pull(n)
+  total= wins+losses+draws
+  winratio<- BinomRatioCI(x1 =wins , n1 = wins+losses,x2 = losses, n2 = wins+losses)
+  backwinratio<-  BinomRatioCI(x1 =wins , n1 = wins+losses,x2 = wins+losses, n2 = wins+losses)
+  net_treatment<- BinomRatioCI(x1 =wins-losses , n1 = total,x2 = total, n2 = total)
+  successodds<- BinomRatioCI(x1 =wins+draws/2 , n1 = total,x2 = losses+draws/2, n2 = total)
+
+  group_level <- rawdata |>
+    group_by(level, result)|>count()
+  tiedtibble <- tibble()
+  filtrawdata<-rawdata
+  for (el in unique(group_level$level)) {
+    filtrawdata <- filtrawdata |> filter(level != el)
+    tied <- count(filtrawdata,wt = NULL)
+    row <- tibble(level = el, result = "Tied",  tied)
+    tiedtibble <- bind_rows(tiedtibble, row)
+  }
+  tiedtibble<- tiedtibble|>slice(-length(tiedtibble))
+  group_level_total<- bind_rows(group_level, tiedtibble)|>
+    arrange(level, match(result, c("Won", "Lost","Tied")))
+  
+  group_level_percentage <- group_level |>
+    mutate(n = n / total*100)|>
+    arrange(level, match(result, c("Won", "Lost","Tied")))
+  
+  return(list(rawdata=rawdata,
+              net_treatment=net_treatment,
+              win_ratio=winratio,
+              back_win_ratio=backwinratio,
+              success_odds=successodds,
+              group_level_total=group_level_total,
+              group_level_percentage= group_level_percentage))}
+
+#Rawdata now contains 4 columns: the combinations of patients from RDN arm to SHAM arm (I kept it so I can manually check that the functions are working correctly) the result of the comparison and at which endpoint the outcome of the comparison happened (level).
+#Additionally, this function will calculate win ratio, backwards win ratio, net treatment and success odds along with their respective confidence intervals.
+```
+
+# Playing around with the function arguments:
+
+```{r}
+t<- c(-5,-10,-1)
+asy_rules="win<=-5,lost>=5;win<=-10,lost>=10;win<=-1,lost>=1"
+
+values <- gpc(RDN,SHAM,asy_rules=asy_rules)
+print(values$win_ratio)
+#           est   lwr.ci   upr.ci
+# <NA> 2.746032 2.505029 3.010221
+
+values <- gpc(RDN,SHAM,thresholds=t) 
+print(values$win_ratio)
+#           est   lwr.ci   upr.ci
+# <NA> 2.746032 2.505029 3.010221
+
+values <- gpc(RDN,SHAM,thresholds=t,asy_rules=asy_rules) 
+print(values$win_ratio)
+#           est   lwr.ci   upr.ci
+# <NA> 2.746032 2.505029 3.010221
+
+
+
+values <- gpc(RDN,SHAM)
+#"Please assign winning thresholds or winning and losing rules for the comparisons"
+```
+
+Manually verifying that the function is performing as anticipated.
+
+```{r}
+rawdata<- values$rawdata
+rawdata|>slice(683) #random row picked
+#   RDNrow SHAMrow result  level
+#    <int>   <int> <chr>   <dbl>
+# 1      3      18 "Lost "     2
+#We expect to have a lost comparison.
+
+RDN |>slice(3)
+#     amb   off   med
+#   <dbl> <dbl> <dbl>
+# 1     5     3  0.25
+
+SHAM |>slice(18)
+#     amb   off   med
+#   <dbl> <dbl> <dbl>
+# 1     2   -10   1.5
+
+#We have a Tied for the Δ ASBP ("amb") column -> 5-2 = 3 ->"Tied".
+#When we consider the following column Δ OSBP ("off") we have a "Lost" comparison -> 3-(-10)= 13 ->"Lost". 
+#For at least this case the output was correctly assigned and the function was working fine.
+```
+
+### Net treatment benefit
+
+$$
+\frac{N_w - N_l}{N_e + N_l + N_t}
+$$
+
+Nw, Nl, and Nt represent the total counts of winner, loser, and tied comparisons, respectively. The measure falls within the range of \[-1, 1\], serving as an absolute measure of treatment effects. It estimates the probability that a randomly chosen subject in the treatment group would score better than a randomly chosen subject in the control group.
+
+A value of 1 indicates that all patients in the treatment group perform better, while -1 suggests a negative impact on all patients. A value of 0 signifies no discernible treatment effect.
+
+### Win ratio
+
+$$
+\frac{N_w }{N_l}
+$$
+
+Another approach to evaluate treatment performance is the Win ratio, defined within the range \[0, ∞\]. A higher Win ratio indicates better treatment performance. It's important to be cautious with this parameter as it does not consider tied comparisons. In situations with a significant number of ties, the Win ratio may be misleading.
+
+The calculated Win ratio is 2.75, a result surprisingly close to the study's reported value of 2.78. This implies a 73% probability of 'winning' (excluding ties) for patients receiving RDN treatment.
+
+### Success Odds
+
+$$
+\frac{N_w + \frac{1}{2} N_t}{N_l + \frac{1}{2} N_t}
+$$
+
+A more robust approach is to utilize the Success odds, defined within the range \[0, ∞\]. Unlike the Win ratio, Success odds consider tied results.
+
+64% of the total comparisons outcomes are determined using the first endpoint.
+
+Only 6.75% comparisons (n=108) are determined using the last endpoint **ΔMedication Index**.
+
+There are 11.5% of Ties (n=184) over a total of 1600 comparisons.
+
+## Andreas function complemented
+
+```{r}
+rawdata <- bind_rows(rdn=RDN,sham=SHAM,.id = "Treatment")
+wrappedtools::WINratio(data = rawdata,
+     groupvar = "Treatment",
+     testvars = c("amb", "off","med"),
+     rules = c(-5,-10,-1))
+# $WINratio
+# [1] "2.75" "2.50" "3.02"
+
+```
+
+```{r}
+values <- gpc(treatmentdata=RDN,controldata=SHAM,thresholds=c(-5,-10,-1))
+#value$win_ratio
+#           est   lwr.ci   upr.ci
+# <NA> 2.746032 2.505029 3.010221
+```
+
+```{r}
+#If there is the string-rule for the asymmetric comparison use my function otherwise use Andreas
+finalfunction <- function (data, groupvar, testvars, rules, asy_rules=NULL, idvar = NULL, p_digits = 3) 
+ if (!is.null(asy_rules)) {
+   splitset<- split(data,  data[[groupvar]])
+   treatmentdata <- splitset[[1]]|> select(-Treatment)
+   controldata <- splitset[[2]] |> select(-Treatment)
+   #My function
+   values <- gpc(treatmentdata=treatmentdata,
+                 controldata=controldata,
+                 asy_rules=asy_rules)
+   return(values)
+ } else { #Andreas
+  if (any(rules == 0)) {
+    stop("rules must not be 0 but give direction and magnitude of minimal difference")
+  }
+  data <- select(data, any_of(c(groupvar, testvars, idvar)))
+  if ((!is.factor(data[[groupvar]]))) {
+    data[[groupvar]] <- factor(data[[groupvar]])
+  }
+  if (nlevels(data[[groupvar]]) != 2) {
+    stop("groupvar must have exactly two levels")
+  }
+  groupvar_level <- levels(data[[groupvar]])
+  grp1 <- filter(data, !!sym(groupvar) == groupvar_level[1])
+  colnames(grp1) <- c("GRP", paste0("X", seq_along(testvars)))
+  grp2 <- filter(data, !!sym(groupvar) == groupvar_level[2])
+  colnames(grp2) <- c("GRP", paste0("Y", seq_along(testvars)))
+  testdata <- mutate(cross_join(grp1, grp2), WIN = 0)
+  for (rule_i in seq_along(rules)) {
+    testdata <- ungroup(mutate(rowwise(testdata), `:=`(!!sym(paste0("rule", 
+      rule_i, "out")), case_when(WIN != 0 ~ NA_integer_, 
+      abs(!!sym(paste0("X", rule_i)) - !!sym(paste0("Y", 
+        rule_i))) >= abs(rules[rule_i]) & (sign(!!sym(paste0("X", 
+        rule_i)) - !!sym(paste0("Y", rule_i))) == sign(rules[rule_i])) ~ 
+        1, abs(!!sym(paste0("X", rule_i)) - !!sym(paste0("Y", 
+        rule_i))) >= abs(rules[rule_i]) & (sign(!!sym(paste0("X", 
+        rule_i)) - !!sym(paste0("Y", rule_i))) != sign(rules[rule_i])) ~ 
+        -1, .default = 0)), WIN = sum(c_across(starts_with("rule")), 
+      na.rm = TRUE)))
+  }
+  WINners <- mutate(mutate(add_row(pivot_wider(pivot_longer(summarize(testdata, 
+    across(starts_with("rule"), list(Wins = ~sum(.x == 1, 
+      na.rm = TRUE), Losses = ~sum(.x == -1, na.rm = TRUE), 
+      Ties = ~sum(.x == 0, na.rm = TRUE), NC = ~sum(is.na(.x))))), 
+    everything(), names_to = c("rule", "outcome"), names_sep = "_"), 
+    names_from = outcome), rule = "all"), across(-rule, 
+    ~case_when(rule == "all" ~ sum(.x, na.rm = TRUE), .default = .x))), 
+    rule = c(paste(testvars, rules, sep = ": "), "all"))
+  p_w <- pull(filter(WINners, rule == "all"), "Wins")
+  p_l <- pull(filter(WINners, rule == "all"), "Losses")
+  p_t <- pull(filter(WINners, rule == "all"), "Ties")
+  p.value <- prop.test(p_w, p_w + p_l)$p.value
+  WINratio <- roundR(DescTools::BinomRatioCI(p_w, nrow(testdata), 
+    p_l, nrow(testdata), method = "katz"), 3)
+  WINodds <- (p_w + p_t * 0.5)/(p_l + p_t * 0.5)
+  WINratioCI <- paste0(roundR(WINratio[1], 3), " (", roundR(WINratio[2], 
+    3), "/", roundR(WINratio[3], 3), ")", " p ", formatP(p.value, 
+    ndigits = p_digits, pretext = TRUE))
+  return(list(WIN = WINners, WINratio = WINratio, WINodds = WINodds, 
+    p.value = p.value, WINratioCI = WINratioCI, testdata = testdata))
+ }
+```
+
+# Final
+
+```{r}
+values<- finalfunction(data = rawdata,
+     groupvar = "Treatment",
+     testvars = c("amb", "off","med"),
+     rules = c(5,-10,-1))
+     # asy_rules = "win<=-7,lost>=5;win<=-10,lost>=10;win<=-1,lost>=1")
+values$WINratio
+#[1] "1.91" "1.76" "2.08"
+
+values2 <- finalfunction(data = rawdata,
+     groupvar = "Treatment",
+     testvars = c("amb", "off","med"),
+     #rules = c(-5,-10,-1),
+     asy_rules = "win>=5,lost<=-5;win<=-10,lost>=10;win<=-1,lost>=1")
+values2$win_ratio
+#         est   lwr.ci   upr.ci
+# <NA> 1.9125 1.762277 2.075529
+```
